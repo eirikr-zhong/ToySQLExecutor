@@ -17,6 +17,7 @@ conan_cmake_install(PATH_OR_REFERENCE .
 find_package(SDL2 REQUIRED)
 find_package(LLVM REQUIRED)
 find_package(pegtl REQUIRED)
+find_package(OpenMP REQUIRED)
 
 add_library(imgui STATIC imgui/imgui.cpp imgui/imgui_tables.cpp
         imgui/imgui_draw.cpp imgui/imgui_widgets.cpp
@@ -34,4 +35,4 @@ set(FONT_PATH "${CMAKE_CURRENT_SOURCE_DIR}/imgui/misc/fonts/Roboto-Medium.ttf")
 
 add_executable(toy_sql_executor main.cpp)
 target_compile_definitions(toy_sql_executor PRIVATE -DJIT_INIT_PATH="${JIT_INIT_PATH}" -DFONT_PATH="${FONT_PATH}")
-target_link_libraries(toy_sql_executor PRIVATE w_manager LLVM::LLVM taocpp::pegtl)
+target_link_libraries(toy_sql_executor PRIVATE w_manager LLVM::LLVM taocpp::pegtl OpenMP::OpenMP_CXX)

@@ -8,6 +8,7 @@
 #include "llvm/ExecutionEngine/Orc/ObjectTransformLayer.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/ValueSymbolTable.h"
 #include "llvm/IRReader/IRReader.h"
@@ -19,6 +20,8 @@
 #include "llvm/MC/MCRegisterInfo.h"
 #include "llvm/MC/MCSubtargetInfo.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Pass.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/TargetSelect.h"
 #include <any>
@@ -35,6 +38,38 @@ struct table {
     int64_t b;
 };
 
+class OptimizationTransform {
+public:
+    OptimizationTransform() = default;
+
+    Expected<ThreadSafeModule> operator()(ThreadSafeModule TSM,
+                                          MaterializationResponsibility &R) {
+        TSM.withModuleDo([this](Module &M) {
+            LoopAnalysisManager LAM;
+            FunctionAnalysisManager FAM;
+            CGSCCAnalysisManager CGAM;
+            ModuleAnalysisManager MAM;
+            PipelineTuningOptions PTO;
+            PTO.LoopVectorization = true;
+            PTO.LoopInterleaving = true;
+            PTO.LoopUnrolling = true;
+            PTO.MergeFunctions = true;
+            PTO.SLPVectorization = true;
+            PassBuilder PB(nullptr, PTO);
+            PB.registerModuleAnalyses(MAM);
+            PB.registerCGSCCAnalyses(CGAM);
+            PB.registerFunctionAnalyses(FAM);
+            PB.registerLoopAnalyses(LAM);
+            PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
+            ModulePassManager MPM = PB.buildPerModuleDefaultPipeline(OptimizationLevel::O3);
+            MPM.run(M, MAM);
+        });
+        return std::move(TSM);
+    }
+
+private:
+};
+
 struct Disassembler {
     Disassembler() {
         Triple triple;
@@ -49,7 +84,6 @@ struct Disassembler {
         const auto asm_info = target->createMCAsmInfo(*register_info, triple.str(), options);
         printer_ = target->createMCInstPrinter(triple, 0, *asm_info, *instr, *register_info);
         sub_ = target->createMCSubtargetInfo(triple.str(), "", "");
-
         context_ = std::make_unique<MCContext>(triple, asm_info, register_info, sub_);
         disassembler_ = target->createMCDisassembler(*sub_, *context_);
     }
@@ -65,7 +99,6 @@ struct Disassembler {
             std::string dis_string;
             llvm::raw_string_ostream ss(dis_string);
             printer_->printInst(&inst, addr, "", *sub_, ss);
-
             std::stringstream stream;
             stream << std::hex << addr;
             inst_string_ += "[";
@@ -94,15 +127,34 @@ private:
 class ExecuteWindow : public WindowsLayer<WindowsManager> {
 public:
     explicit ExecuteWindow(WindowsManager &manager, std::unique_ptr<LLJIT> &lljit, const std::vector<table> &table) : lljit_(lljit), table_(table), WindowsLayer<WindowsManager>(manager) {
+        lljit_->getIRTransformLayer().setTransform([this](ThreadSafeModule TSM,
+                                                          MaterializationResponsibility &R) {
+            if (this->opt)
+                return this->otf_.operator()(std::move(TSM), R);
+            return Expected<ThreadSafeModule>(std::move(TSM));
+        });
+
+        lljit_->getIRCompileLayer().setNotifyCompiled([this](auto &_, auto M) {
+            M.withModuleDo([this](auto &Module) {
+                ir_.clear();
+                llvm::raw_string_ostream ss(ir_);
+                Module.print(ss, nullptr);
+            });
+        });
     }
     void Draw() override {
-
         ImGui::SetNextWindowSize(ImVec2(500, 400), ImGuiCond_FirstUseEver);
         ImGui::Begin("TableWindow");
         ImGui::InputText("SQL Input", &sql_);
         ImGui::SameLine();
+        ImGui::Checkbox("Optimization", &opt);
+        ImGui::SameLine();
         if (ImGui::Button("Compile")) {
             this->Compile(sql_);
+        }
+        ImGui::SameLine();
+        if (!this->ir_.empty() && ImGui::Button("Execute")) {
+            this->execute();
         }
 
         if (ast_ != nullptr && ImGui::CollapsingHeader("AstTree")) {
@@ -115,15 +167,37 @@ public:
         }
 
         if (!ir_.empty() && ImGui::CollapsingHeader("LLVM IR")) {
-            ImGui::BeginChild("scrolling", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::BeginChild("scrolling_llvm_ir", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
             ImGui::TextUnformatted(this->ir_.data());
             ImGui::EndChild();
         }
 
         if (!asm_.empty() && ImGui::CollapsingHeader("Assembly")) {
-            ImGui::BeginChild("scrolling", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::BeginChild("scrolling_assembly", ImVec2(0, 0), false, ImGuiWindowFlags_HorizontalScrollbar);
             ImGui::TextUnformatted(this->asm_.data());
             ImGui::EndChild();
+        }
+        ImVec2 outer_size = ImVec2(0.0f, ImGui::GetTextLineHeight() * 32);
+        static ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable | ImGuiTableFlags_Reorderable | ImGuiTableFlags_Hideable;
+        if (!result_.empty() && ImGui::BeginTable("result_table", 2, flags, outer_size)) {
+            ImGui::TableSetupScrollFreeze(0, 1);// Make top row always visible
+            ImGui::TableSetupColumn("A", ImGuiTableColumnFlags_None);
+            ImGui::TableSetupColumn("B", ImGuiTableColumnFlags_None);
+            ImGui::TableHeadersRow();
+
+            ImGuiListClipper clipper;
+            clipper.Begin(this->result_.size());
+            while (clipper.Step()) {
+                int i = clipper.DisplayStart;
+                for (; i < clipper.DisplayEnd; i++) {
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    ImGui::Text("%ld", this->result_[i].a);
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("%ld", this->result_[i].b);
+                }
+            }
+            ImGui::EndTable();
         }
         ImGui::End();
     }
@@ -183,6 +257,7 @@ public:
         g_table_info->setInitializer(ConstantArray::get(ArrayType::get(table_column_info_type, 2), {value, b_value}));
         g_table_info->setConstant(true);
 
+
         auto col_a_str = ConstantDataArray::getString(*llvm_context_, "a");
         jit_module_->getOrInsertGlobal("str#a", col_a_str->getType());
         auto col_a = jit_module_->getNamedGlobal("str#a");
@@ -214,15 +289,17 @@ public:
         builder.SetInsertPoint(bb);
         GenCode(ast_, builder, bb, jit_module_);
 
-        builder.CreateCondBr(any_cast<Value *>(stack_.back()), true_block_, false_block_);
-        stack_.pop_back();
+        if (stack_.size() == 1) {
+            builder.CreateCondBr(any_cast<Value *>(stack_.back()), true_block_, false_block_);
+            stack_.pop_back();
+        } else {
+            builder.CreateBr(true_block_);
+        }
         stack_.clear();
 
         rt_ = std::make_unique<IntrusiveRefCntPtr<ResourceTracker>>(lljit_->getMainJITDylib().createResourceTracker());
-        ir_.clear();
-        llvm::raw_string_ostream ss(ir_);
-        jit_module_->print(ss, nullptr);
         ExitOnErr(lljit_->addIRModule(*rt_, ThreadSafeModule(std::move(jit_module_), std::move(llvm_context_))));
+
         auto addr = ExitOnErr(lljit_->lookup("query"));
         ArrayRef<uint8_t> ref(addr.toPtr<const unsigned char *>(), 1024);
         Disassembler d;
@@ -230,9 +307,18 @@ public:
         asm_ = d.get_asm();
     }
 
-    bool execute(void *ptr) {
+    void execute() {
         auto addr = ExitOnErr(lljit_->lookup("query"));
-        return addr.toPtr<bool(void *)>()(ptr);
+        result_.clear();
+#pragma omp parallel for ordered default(none) shared(addr)
+        for (const auto & i : this->table_) {
+            if (addr.toPtr<bool(void *)>()((void *) &i)) {
+#pragma omp critical
+                {
+                    result_.emplace_back(i);
+                }
+            }
+        }
     }
 
 private:
@@ -300,9 +386,12 @@ private:
     std::unique_ptr<IntrusiveRefCntPtr<ResourceTracker>> rt_;
     std::string asm_;
     const std::vector<table> &table_;
+    std::vector<table> result_;
     std::string sql_ = "select * from table where a = 1 and b = 2";
     std::unique_ptr<SQLParser::parse_tree::node> ast_ = nullptr;
     std::string ir_;
+    bool opt = false;
+    OptimizationTransform otf_;
 };
 
 
@@ -313,12 +402,14 @@ int main(int argc, const char **argv) {
     InitializeNativeTargetAsmPrinter();
     auto jit = ExitOnErr(LLJITBuilder().create());
 
+
     std::vector<table> table_data;
-    for (auto i = 0; i < 100; i++) {
-        for (auto j = 0; j < 100; j++) {
+    for (auto i = 0; i < 10000; i++) {
+        for (auto j = 0; j < 10000; j++) {
             table_data.emplace_back(table{i, j});
         }
     }
+
 
     try {
         WindowsManager manager(0, 0);

@@ -45,7 +45,7 @@ namespace ToySQLEngine::SQLParser {
     struct select_column : one<'*'> {};
     struct select_from : TAO_PEGTL_ISTRING("from") {};
     struct select_table_name : table_name {};
-    struct select_stmt : if_must<select_start, pad<select_column, white_space>, select_from, plus<white_space>, select_table_name, plus<white_space>, opt<where_stmt>, eof> {};
+    struct select_stmt : if_must<select_start, pad<select_column, white_space>, select_from, plus<white_space>, select_table_name, star<white_space>, opt<where_stmt>, eof> {};
 
     template<typename Rule>
     using token_selector = parse_tree::selector<Rule,
